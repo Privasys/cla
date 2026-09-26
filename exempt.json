@@ -1,4 +1,6 @@
 {
   "comment": "Privasys staff. Their work belongs to Privasys Ltd as their employer, so they sign no agreement. Match is on the numeric GitHub id.",
-  "accounts": []
+  "accounts": [
+    { "login": "bfoing", "id": 40759640 }
+  ]
 }
