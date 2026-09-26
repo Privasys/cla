@@ -1,0 +1,176 @@
+# The Contributor Licence Agreement check, called by every Privasys repository
+# that takes outside contributions (templates/cla.yml is the caller).
+#
+# It never checks out or runs the code of the pull request: it only reads the
+# pull request's commits through the API, so running on pull_request_target
+# (which has the secrets, also for pull requests from forks) is safe.
+#
+# Signatures live on the `signatures` branch of Privasys/cla, keyed by the
+# numeric GitHub account id (a login can be renamed, the id cannot):
+#   v1/individuals.json  written by this workflow when someone accepts
+#   v1/entities.json     written by hand when an entity agreement is signed
+#   exempt.json          Privasys staff, written by hand
+name: Contributor Licence Agreement
+
+on:
+  workflow_call:
+    secrets:
+      signatures-token:
+        description: Fine-grained token with contents read and write on Privasys/cla only.
+        required: true
+
+permissions: {}
+
+jobs:
+  check:
+    name: CLA
+    runs-on: ubuntu-latest
+    # Pull request events, and only those pull request comments that can
+    # change the result. Bots are skipped: on a pull request opened by
+    # Dependabot the job gets Dependabot's secrets, not this token, and a bot
+    # needs no agreement anyway.
+    if: >-
+      !endsWith(github.actor, '[bot]') &&
+      (github.event_name == 'pull_request_target' ||
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+          (github.event.comment.body == 'recheck' ||
+           contains(github.event.comment.body, 'Privasys Contributor Licence Agreement'))))
+    permissions:
+      pull-requests: write
+      statuses: write
+    concurrency:
+      group: cla-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SIGNATURES_TOKEN: ${{ secrets.signatures-token }}
+        with:
+          script: |
+            const VERSION = 'v1';
+            const SENTENCE = 'I have read the Privasys Contributor Licence Agreement v1.0 and I accept it.';
+            const INDIVIDUAL_URL = 'https://github.com/Privasys/cla/blob/main/individual-cla.md';
+            const ENTITY_URL = 'https://github.com/Privasys/cla/blob/main/entity-cla.md';
+            const MARKER = '<!-- privasys-cla -->';
+            const STATUS_CONTEXT = 'Contributor Licence Agreement';
+            const STORE = { owner: 'Privasys', repo: 'cla', ref: 'signatures' };
+            const INDIVIDUALS = `${VERSION}/individuals.json`;
+
+            const store = getOctokit(process.env.SIGNATURES_TOKEN);
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request?.number ?? context.payload.issue.number;
+
+            async function readJSON(path) {
+              const { data } = await store.rest.repos.getContent({ ...STORE, path });
+              return { json: JSON.parse(Buffer.from(data.content, 'base64').toString('utf8')), sha: data.sha };
+            }
+
+            // Everyone who authored or committed on the pull request. A commit
+            // whose email is not linked to a GitHub account cannot be matched
+            // to a signature, so it is reported by name and blocks the check.
+            const pr = (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner, repo, pull_number: number, per_page: 100,
+            });
+            const people = new Map();
+            const unlinked = new Set();
+            for (const c of commits) {
+              for (const [user, git] of [[c.author, c.commit.author], [c.committer, c.commit.committer]]) {
+                if (user?.login === 'web-flow') continue; // GitHub's own committer for web edits and merges
+                if (user) people.set(user.id, user);
+                else if (git) unlinked.add(`${git.name} <${git.email}>`);
+              }
+            }
+
+            const [{ json: exempt }, { json: entities }, individuals] = await Promise.all([
+              readJSON('exempt.json'), readJSON(`${VERSION}/entities.json`), readJSON(INDIVIDUALS),
+            ]);
+            const covered = new Set([
+              ...exempt.accounts.map(a => a.id),
+              ...entities.entities.flatMap(e => e.contributors.map(a => a.id)),
+              ...individuals.json.signatures.map(s => s.id),
+            ]);
+            const isCovered = u => u.type === 'Bot' || u.login.endsWith('[bot]') || covered.has(u.id);
+
+            // A contributor accepting the agreement in a comment on this pull request.
+            const comment = context.payload.comment;
+            if (comment && comment.body.trim() === SENTENCE && people.has(comment.user.id) && !isCovered(comment.user)) {
+              const record = {
+                login: comment.user.login,
+                id: comment.user.id,
+                signed_at: comment.created_at,
+                repository: `${owner}/${repo}`,
+                pull_request: number,
+                comment_url: comment.html_url,
+              };
+              // Another repository may record a signature at the same time:
+              // on a conflict, re-read the file and try again.
+              for (let attempt = 1; ; attempt++) {
+                const current = attempt === 1 ? individuals : await readJSON(INDIVIDUALS);
+                if (!current.json.signatures.some(s => s.id === record.id)) {
+                  current.json.signatures.push(record);
+                }
+                try {
+                  await store.rest.repos.createOrUpdateFileContents({
+                    owner: STORE.owner, repo: STORE.repo, branch: STORE.ref, path: INDIVIDUALS,
+                    sha: current.sha,
+                    message: `Record the signature of @${record.login} (${owner}/${repo}#${number})`,
+                    content: Buffer.from(JSON.stringify(current.json, null, 2) + '\n').toString('base64'),
+                  });
+                  break;
+                } catch (e) {
+                  if (attempt >= 5 || (e.status !== 409 && e.status !== 422)) throw e;
+                }
+              }
+              covered.add(record.id);
+            }
+
+            const missing = [...people.values()].filter(u => !isCovered(u));
+            const ok = missing.length === 0 && unlinked.size === 0;
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: pr.head.sha, context: STATUS_CONTEXT,
+              state: ok ? 'success' : 'failure',
+              target_url: INDIVIDUAL_URL,
+              description: ok
+                ? 'All contributors have accepted the agreement.'
+                : `Waiting for ${missing.length + unlinked.size} contributor(s) to accept the agreement.`,
+            });
+
+            // One comment per pull request, kept up to date. Nothing is posted
+            // on a pull request whose contributors are all covered already.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: number, per_page: 100,
+            });
+            const mine = comments.find(c => c.user.type === 'Bot' && c.body.startsWith(MARKER));
+            let body;
+            if (ok) {
+              if (!mine) return;
+              body = `${MARKER}\nThank you. Every contributor to this pull request has accepted the [Privasys Contributor Licence Agreement](${INDIVIDUAL_URL}).`;
+            } else {
+              const lines = [
+                MARKER,
+                `Thank you for your contribution. Before we can merge it, every contributor needs to accept the [Privasys Contributor Licence Agreement](${INDIVIDUAL_URL}). You keep the copyright in your work; the agreement lets Privasys distribute it under other licences as well, and Privasys commits to keeping it available under an open-source licence.`,
+                '',
+                'To accept, post this exact sentence as a comment on this pull request. It covers every Privasys repository, so you only do it once:',
+                '',
+                '```',
+                SENTENCE,
+                '```',
+                '',
+                `If you contribute as part of your work for an employer, your employer may need to sign the [entity agreement](${ENTITY_URL}) instead.`,
+              ];
+              if (missing.length) {
+                lines.push('', 'Waiting for:', ...missing.map(u => `- @${u.login}`));
+              }
+              if (unlinked.size) {
+                lines.push('',
+                  'These commits use an email address that is not linked to a GitHub account, so they cannot be matched to a signature. Add the address to your GitHub account (Settings, Emails), or rewrite the commits with an address that is, then comment `recheck`:',
+                  ...[...unlinked].map(a => `- ${a}`));
+              }
+              body = lines.join('\n');
+            }
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+            }
